@@ -57,6 +57,8 @@ export async function POST(req: NextRequest) {
       const extraction = await extractMenuCandidates({
         rawMenuText: body.rawMenuText,
         fileName: body.fileName,
+        imageBase64: body.imageBase64,
+        mimeType: body.mimeType,
       });
       return NextResponse.json(extraction);
     }

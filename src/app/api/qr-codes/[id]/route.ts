@@ -6,8 +6,8 @@ import {
   assertOrgAccess,
   assertPlanEntitlement,
   AuthorizationError,
-  mutateDb,
-  readDb,
+  mutateDbAsync,
+  readDbAsync,
 } from '@/lib/db/store';
 import {
   generateShortSlug,
@@ -27,7 +27,7 @@ export async function GET(
     }
 
     const { id } = await context.params;
-    const db = readDb();
+    const db = await readDbAsync();
     const qr = db.qrCodes.find((q) => q.id === id);
     if (!qr) {
       return NextResponse.json({ error: 'QR code not found.' }, { status: 404 });
@@ -79,7 +79,7 @@ export async function PATCH(
       req.headers.get('origin') ||
       `http://${req.headers.get('host') || 'localhost:3000'}`;
 
-    const result = mutateDb((db) => {
+    const result = await mutateDbAsync((db) => {
       const qr = db.qrCodes.find((q) => q.id === id);
       if (!qr) {
         throw new AuthorizationError('QR code not found.', 404);
@@ -260,7 +260,7 @@ export async function DELETE(
 
     const { id } = await context.params;
 
-    mutateDb((db) => {
+    await mutateDbAsync((db) => {
       const idx = db.qrCodes.findIndex((q) => q.id === id);
       if (idx === -1) {
         throw new AuthorizationError('QR code not found.', 404);

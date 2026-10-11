@@ -2,9 +2,10 @@ node_modules/
 .next/
 out/
 build/
+.backups/
 .env
-.env.local
-.env.*.local
+.env*
+!.env.example
 playwright-report/
 test-results/
 coverage/
@@ -13,3 +14,4 @@ coverage/
 
 data/rmqr-db.json
 data/rmqr-db.backup.json
+data/*.tmp

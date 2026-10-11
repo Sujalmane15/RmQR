@@ -9,9 +9,9 @@ import {
   assertPlanEntitlement,
   AuthorizationError,
   findReviewCampaignBySlug,
-  mutateDb,
+  mutateDbAsync,
   pruneExpiredReviewSessions,
-  readDb,
+  readDbAsync,
 } from '@/lib/db/store';
 import {
   checkRateLimit,
@@ -23,9 +23,10 @@ import {
 import {
   generateCustomerReviewAgentDrafts,
   generateCustomerReviewSuggestions,
-  generateOwnerReviewReplyDraft,
+  generateOwnerReviewReplyWithAI,
 } from '@/lib/ai/services';
 import { getAIProviderStatus } from '@/lib/ai/agent-engine';
+import { getSupabaseConfigStatus } from '@/lib/supabase/server';
 import {
   generateCustomQRSvg,
   generateQRPngBuffer,
@@ -44,7 +45,14 @@ import {
 } from '@/lib/types';
 
 function signSessionId(sessionId: string): string {
-  const secret = process.env.RMQR_SESSION_SECRET || 'rmqr-review-session-signing-key-v1';
+  const secret = (process.env.RMQR_SESSION_SECRET || '').trim();
+  const isProduction = process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
+  if (!secret) {
+    if (isProduction) {
+      throw new Error('Critical security violation: RMQR_SESSION_SECRET is required in production.');
+    }
+    return crypto.createHmac('sha256', 'rmqr-review-session-signing-key-v1').update(sessionId).digest('hex').slice(0, 32);
+  }
   return crypto.createHmac('sha256', secret).update(sessionId).digest('hex').slice(0, 32);
 }
 
@@ -81,7 +89,7 @@ export async function GET() {
     const session = await getCurrentSession();
     if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
-    const db = readDb();
+    const db = await readDbAsync();
     assertOrgAccess(db, session.user.id, session.activeOrg.id);
 
     const campaigns = db.reviewCampaigns.filter(
@@ -99,6 +107,7 @@ export async function GET() {
       reviewResponseLogs,
       gbpIntegration: getGbpIntegrationStatus(),
       aiProviderStatus: getAIProviderStatus(),
+      supabaseStatus: getSupabaseConfigStatus(),
       deploymentInfo: inspectPublicDeploymentOrigin(undefined, 'rm-solution'),
       reviewSessionsCount: activeSessions.length,
     });
@@ -140,7 +149,7 @@ export async function POST(req: NextRequest) {
       const lang: ReviewReplyLanguage =
         body.language === 'hi' || body.language === 'mr' ? body.language : 'en';
 
-      const db = readDb();
+      const db = await readDbAsync();
       const campaign = findReviewCampaignBySlug(db, slugInput);
       if (!campaign || campaign.status !== 'active' || campaign.reviewAgentEnabled === false) {
         return NextResponse.json(
@@ -154,7 +163,7 @@ export async function POST(req: NextRequest) {
       const now = new Date();
       const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
 
-      mutateDb((state) => {
+      await mutateDbAsync((state) => {
         pruneExpiredReviewSessions(state);
         const newSession: CustomerReviewSession = {
           id: sessionId,
@@ -206,7 +215,7 @@ export async function POST(req: NextRequest) {
       const sessionToken = String(body.sessionToken || '').trim();
       const slugInput = String(body.slug || 'rm-solution').trim();
 
-      const db = readDb();
+      const db = await readDbAsync();
       const campaign = findReviewCampaignBySlug(db, slugInput);
       if (!campaign || campaign.status !== 'active' || campaign.reviewAgentEnabled === false) {
         return NextResponse.json(
@@ -278,7 +287,7 @@ export async function POST(req: NextRequest) {
       }
 
       if (sessionId && existingSession) {
-        mutateDb((state) => {
+        await mutateDbAsync((state) => {
           const target = (state.customerReviewSessions || []).find((s) => s.id === sessionId);
           if (target) {
             target.language = lang;
@@ -314,7 +323,7 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      mutateDb((state) => {
+      await mutateDbAsync((state) => {
         const target = (state.customerReviewSessions || []).find((s) => s.id === sessionId);
         if (!target) return;
         if (body.selectedDraft !== undefined) {
@@ -338,7 +347,7 @@ export async function POST(req: NextRequest) {
     // Public action 2: Record when a customer clicks "Continue to Google Reviews" on /review/[slug]
     if (body.action === 'track_google_click') {
       const campaignId = String(body.campaignId || '');
-      mutateDb((db) => {
+      await mutateDbAsync((db) => {
         const rc = db.reviewCampaigns.find((r) => r.id === campaignId);
         if (rc) rc.googleClickCount = (rc.googleClickCount || 0) + 1;
       });
@@ -350,7 +359,7 @@ export async function POST(req: NextRequest) {
 
     // Owner action 3: Generate AI-assisted multilingual reply options to a customer review (never auto-published)
     if (body.action === 'generate_owner_reply') {
-      const db = readDb();
+      const db = await readDbAsync();
       assertOrgAccess(db, session.user.id, session.activeOrg.id, ['owner', 'admin', 'editor']);
 
       const rmCampaign = db.reviewCampaigns.find(
@@ -360,7 +369,7 @@ export async function POST(req: NextRequest) {
       );
       const defaultPhone = rmCampaign?.contactPhone || '7400342769';
 
-      const result = generateOwnerReviewReplyDraft({
+      const result = await generateOwnerReviewReplyWithAI({
         businessName: String(body.businessName || rmCampaign?.businessName || 'RM Solution'),
         reviewerName: String(body.reviewerName || ''),
         rating: body.rating !== undefined ? Number(body.rating) : undefined,
@@ -395,7 +404,7 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      const saved = mutateDb((db) => {
+      const saved = await mutateDbAsync((db) => {
         assertOrgAccess(db, session.user.id, session.activeOrg.id, ['owner', 'admin', 'editor']);
         const now = new Date().toISOString();
         const item: ReviewResponseLogItem = {
@@ -483,7 +492,7 @@ export async function POST(req: NextRequest) {
       const reviewAgentEnabled =
         body.reviewAgentEnabled !== undefined ? Boolean(body.reviewAgentEnabled) : undefined;
 
-      const updatedCampaign = mutateDb((db) => {
+      const updatedCampaign = await mutateDbAsync((db) => {
         assertOrgAccess(db, session.user.id, session.activeOrg.id, ['owner', 'admin', 'editor']);
         const now = new Date().toISOString();
         let rmCampaign = db.reviewCampaigns.find(
@@ -573,7 +582,7 @@ export async function POST(req: NextRequest) {
 
     // Owner action 5B: Verify Mode A (AI Agent Website QR) & Mode B (Direct Google Review QR) via jsQR decode
     if (body.action === 'verify_qr_destinations') {
-      const db = readDb();
+      const db = await readDbAsync();
       assertOrgAccess(db, session.user.id, session.activeOrg.id);
 
       const rmCampaign = findReviewCampaignBySlug(db, 'rm-solution');
@@ -674,7 +683,7 @@ export async function POST(req: NextRequest) {
 
     // Owner action 6: Honest Google Business Profile API Fetch check (never fabricates fetched reviews)
     if (body.action === 'fetch_google_reviews') {
-      const db = readDb();
+      const db = await readDbAsync();
       assertOrgAccess(db, session.user.id, session.activeOrg.id, ['owner', 'admin', 'editor']);
       const gbp = getGbpIntegrationStatus();
       if (!gbp.configured) {
@@ -693,7 +702,7 @@ export async function POST(req: NextRequest) {
 
     // Owner action 7: Honest Google Business Profile API Publish check (requires human approval + live OAuth)
     if (body.action === 'publish_to_google') {
-      const db = readDb();
+      const db = await readDbAsync();
       assertOrgAccess(db, session.user.id, session.activeOrg.id, ['owner', 'admin', 'editor']);
       if (body.humanApproved !== true) {
         return NextResponse.json(
@@ -745,7 +754,7 @@ export async function POST(req: NextRequest) {
     const isLocalhostOrigin =
       origin.includes('localhost') || origin.includes('127.0.0.1');
 
-    const created = mutateDb((db) => {
+    const created = await mutateDbAsync((db) => {
       assertOrgAccess(db, session.user.id, session.activeOrg.id, ['owner', 'admin', 'editor']);
       assertPlanEntitlement(db, session.activeOrg.id, 'reviewCampaigns');
 
@@ -860,7 +869,7 @@ export async function PATCH(req: NextRequest) {
     // Update or approve an existing saved review response log item
     if (body.action === 'update_review_response') {
       const responseId = String(body.responseId || body.id || '');
-      const updatedItem = mutateDb((db) => {
+      const updatedItem = await mutateDbAsync((db) => {
         const item = (db.reviewResponseLogs || []).find((r) => r.id === responseId);
         if (!item) throw new AuthorizationError('Review response item not found.', 404);
         assertOrgAccess(db, session.user.id, item.organizationId, ['owner', 'admin', 'editor']);
@@ -900,7 +909,7 @@ export async function PATCH(req: NextRequest) {
 
     const id = String(body.id || '');
 
-    const updated = mutateDb((db) => {
+    const updated = await mutateDbAsync((db) => {
       const rc = db.reviewCampaigns.find((r) => r.id === id);
       if (!rc) throw new AuthorizationError('Review campaign not found.', 404);
       assertOrgAccess(db, session.user.id, rc.organizationId, ['owner', 'admin', 'editor']);
@@ -951,7 +960,7 @@ export async function DELETE(req: NextRequest) {
       return NextResponse.json({ error: 'responseId query parameter is required.' }, { status: 400 });
     }
 
-    mutateDb((db) => {
+    await mutateDbAsync((db) => {
       const idx = (db.reviewResponseLogs || []).findIndex((r) => r.id === responseId);
       if (idx === -1) throw new AuthorizationError('Review response item not found.', 404);
       const target = db.reviewResponseLogs[idx];

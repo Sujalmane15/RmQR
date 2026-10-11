@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
-import { appendAuditLog, mutateDb, readDb } from '@/lib/db/store';
+import { appendAuditLog, mutateDbAsync, readDbAsync } from '@/lib/db/store';
 import { checkRateLimit, verifyPassword } from '@/lib/security';
 import { createSessionToken, SESSION_COOKIE_NAME } from '@/lib/auth/session';
 
@@ -30,13 +30,23 @@ export async function POST(req: NextRequest) {
     }
 
     const email = parsed.data.email.toLowerCase().trim();
-    const db = readDb();
+    const db = await readDbAsync();
     const profile = db.profiles.find((p) => p.email.toLowerCase() === email);
 
     if (!profile || !verifyPassword(parsed.data.password, profile.passwordHash)) {
       return NextResponse.json(
         { error: 'Invalid email or password.' },
         { status: 401 }
+      );
+    }
+
+    const isProduction = process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
+
+    // Prevent default seeded demo accounts from being used as admin in production
+    if (isProduction && (email === 'admin@rmqr.app' || email === 'owner@rmqr.app')) {
+      return NextResponse.json(
+        { error: 'Default demo accounts are disabled in production for security. Please sign in with your registered organization account.' },
+        { status: 403 }
       );
     }
 
@@ -53,7 +63,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    mutateDb((state) => {
+    await mutateDbAsync((state) => {
       appendAuditLog(state, {
         organizationId: activeOrg.id,
         actorId: profile.id,
@@ -76,6 +86,7 @@ export async function POST(req: NextRequest) {
 
     res.cookies.set(SESSION_COOKIE_NAME, token, {
       httpOnly: true,
+      secure: isProduction,
       sameSite: 'lax',
       path: '/',
       maxAge: 60 * 60 * 24 * 7,

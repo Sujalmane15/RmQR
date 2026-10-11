@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
-import { mutateDb, readDb } from '@/lib/db/store';
+import { mutateDbAsync, readDbAsync } from '@/lib/db/store';
 import {
   checkRateLimit,
   computeVisitorHash,
@@ -126,7 +126,7 @@ async function handleRedirectRequest(
     );
   }
 
-  const db = readDb();
+  const db = await readDbAsync();
   const qr = db.qrCodes.find((q) => q.slug.toLowerCase() === slug.toLowerCase());
 
   if (!qr) {
@@ -298,7 +298,7 @@ async function handleRedirectRequest(
   const now = new Date().toISOString();
 
   // Persist scan event in the database
-  mutateDb((state) => {
+  await mutateDbAsync((state) => {
     const targetQr = state.qrCodes.find((q) => q.id === qr.id);
     if (targetQr) {
       targetQr.scanCount = (targetQr.scanCount || 0) + 1;

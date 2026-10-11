@@ -6,8 +6,8 @@ import {
   assertOrgAccess,
   assertPlanEntitlement,
   AuthorizationError,
-  mutateDb,
-  readDb,
+  mutateDbAsync,
+  readDbAsync,
 } from '@/lib/db/store';
 import {
   generateShortSlug,
@@ -33,7 +33,7 @@ export async function GET(req: NextRequest) {
     const folderId = searchParams.get('folderId') || 'all';
     const campaignId = searchParams.get('campaignId') || 'all';
 
-    const db = readDb();
+    const db = await readDbAsync();
     assertOrgAccess(db, session.user.id, requestedOrgId, ['owner', 'admin', 'editor', 'viewer']);
 
     let list = db.qrCodes.filter((q) => q.organizationId === requestedOrgId);
@@ -125,7 +125,7 @@ export async function POST(req: NextRequest) {
       req.headers.get('origin') ||
       `http://${req.headers.get('host') || 'localhost:3000'}`;
 
-    const created = mutateDb((db) => {
+    const created = await mutateDbAsync((db) => {
       assertOrgAccess(db, session.user.id, targetOrgId, ['owner', 'admin', 'editor']);
 
       if (qrType === 'dynamic') {

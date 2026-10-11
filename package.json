@@ -15,7 +15,7 @@
   },
   "dependencies": {
     "@supabase/ssr": "^0.5.2",
-    "@supabase/supabase-js": "^2.49.1",
+    "@supabase/supabase-js": "^2.117.3",
     "clsx": "^2.1.1",
     "jspdf": "^2.5.2",
     "jsqr": "^1.4.0",

@@ -40,6 +40,11 @@ import {
   WebhookEndpoint,
 } from '../types';
 import { hashPassword } from '../security';
+import {
+  getSupabaseConfigStatus,
+  loadStateFromSupabase,
+  syncStateToSupabase,
+} from '../supabase/server';
 
 export interface DatabaseSchema {
   profiles: Profile[];
@@ -886,48 +891,209 @@ function ensureBackwardCompatibleCollections(db: DatabaseSchema): boolean {
   return mutated;
 }
 
-export function readDb(): DatabaseSchema {
-  const dbPath = getDbFilePath();
-  const dir = path.dirname(dbPath);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-  if (!fs.existsSync(dbPath)) {
-    const seed = createInitialSeedData();
-    ensureBackwardCompatibleCollections(seed);
-    fs.writeFileSync(dbPath, JSON.stringify(seed, null, 2), 'utf8');
-    return seed;
+let memoryDbCache: DatabaseSchema | null = null;
+let lastSupabaseHydratedAt = 0;
+
+function tryWriteLocalJsonFile(data: DatabaseSchema): void {
+  // Never fail on read-only serverless filesystems (such as Vercel /var/task)
+  if (process.env.VERCEL === '1') {
+    return;
   }
   try {
-    const raw = fs.readFileSync(dbPath, 'utf8');
-    const parsed = JSON.parse(raw) as DatabaseSchema;
-    if (ensureBackwardCompatibleCollections(parsed)) {
-      writeDb(parsed);
+    const dbPath = getDbFilePath();
+    const dir = path.dirname(dbPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
     }
-    return parsed;
+    const tmpPath = `${dbPath}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
+    fs.renameSync(tmpPath, dbPath);
   } catch {
-    const seed = createInitialSeedData();
-    ensureBackwardCompatibleCollections(seed);
-    fs.writeFileSync(dbPath, JSON.stringify(seed, null, 2), 'utf8');
-    return seed;
+    // Ignore EROFS / read-only filesystem errors in serverless environments
   }
 }
 
-export function writeDb(data: DatabaseSchema): void {
+export function readDb(): DatabaseSchema {
   const dbPath = getDbFilePath();
-  const dir = path.dirname(dbPath);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+  try {
+    if (fs.existsSync(dbPath)) {
+      const raw = fs.readFileSync(dbPath, 'utf8');
+      const parsed = JSON.parse(raw) as DatabaseSchema;
+      if (ensureBackwardCompatibleCollections(parsed)) {
+        tryWriteLocalJsonFile(parsed);
+      }
+      memoryDbCache = parsed;
+      return parsed;
+    }
+  } catch {
+    // Fall through to memoryDbCache or seed initialization
   }
-  const tmpPath = `${dbPath}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
-  fs.renameSync(tmpPath, dbPath);
+
+  if (memoryDbCache) {
+    ensureBackwardCompatibleCollections(memoryDbCache);
+    return memoryDbCache;
+  }
+
+  const seed = createInitialSeedData();
+  ensureBackwardCompatibleCollections(seed);
+  memoryDbCache = seed;
+  tryWriteLocalJsonFile(seed);
+  return seed;
+}
+
+export function writeDb(data: DatabaseSchema): void {
+  memoryDbCache = data;
+  tryWriteLocalJsonFile(data);
+
+  if (getSupabaseConfigStatus().configured) {
+    void syncStateToSupabase(data);
+  }
 }
 
 export function mutateDb<T>(mutator: (db: DatabaseSchema) => T): T {
   const db = readDb();
   const result = mutator(db);
   writeDb(db);
+  return result;
+}
+
+/**
+ * Asynchronously reads the database, hydrating from Supabase PostgreSQL first when configured.
+ * CRITICAL SAFETY GUARANTEE:
+ * - NEVER automatically initializes, seeds, or writes to remote Supabase on read.
+ * - Handles errors, unapplied migrations, network failures, and empty states without overwriting data.
+ */
+export async function readDbAsync(): Promise<DatabaseSchema> {
+  const sbStatus = getSupabaseConfigStatus();
+  if (sbStatus.configured) {
+    const now = Date.now();
+    // Refresh from Supabase if cache is empty or older than 2 seconds
+    if (!memoryDbCache || now - lastSupabaseHydratedAt > 2000) {
+      const loadResult = await loadStateFromSupabase();
+      if (loadResult.status === 'ok') {
+        ensureBackwardCompatibleCollections(loadResult.data);
+        memoryDbCache = loadResult.data;
+        lastSupabaseHydratedAt = now;
+        tryWriteLocalJsonFile(loadResult.data);
+        return loadResult.data;
+      }
+
+      // If remote state is genuinely empty, return local readDb() in memory WITHOUT automatically overwriting remote Supabase
+      if (loadResult.status === 'empty') {
+        const local = readDb();
+        memoryDbCache = local;
+        return local;
+      }
+
+      // If Supabase encountered an error, missing table, or network failure:
+      // DO NOT overwrite remote data with initial seed!
+      if (loadResult.status === 'missing_table' || loadResult.status === 'error') {
+        console.warn(`[RMQR Database] Supabase query notice: ${loadResult.error}. Using local/cached state without remote overwrite.`);
+      }
+    }
+    if (memoryDbCache) {
+      return memoryDbCache;
+    }
+  }
+
+  return readDb();
+}
+
+/**
+ * Explicit, guarded, idempotent initialization for Supabase PostgreSQL.
+ * Only writes to Supabase if the remote state is confirmed 'empty' AND confirmed is explicitly true.
+ */
+export async function initializeSupabaseDatabase(options: {
+  confirmed: boolean;
+  sourceDb?: DatabaseSchema;
+}): Promise<{ ok: boolean; status: string; message: string }> {
+  if (!options.confirmed) {
+    return {
+      ok: false,
+      status: 'unconfirmed',
+      message: 'Explicit confirmation (confirmed: true) is required to initialize remote database.',
+    };
+  }
+
+  const sbStatus = getSupabaseConfigStatus();
+  if (!sbStatus.configured) {
+    return {
+      ok: false,
+      status: 'unconfigured',
+      message: 'Supabase credentials are not configured in environment.',
+    };
+  }
+
+  const loadResult = await loadStateFromSupabase();
+  if (loadResult.status === 'ok') {
+    return {
+      ok: false,
+      status: 'already_initialized',
+      message: 'Remote Supabase database already contains existing state. Refusing to overwrite.',
+    };
+  }
+
+  if (loadResult.status === 'missing_table') {
+    return {
+      ok: false,
+      status: 'missing_table',
+      message: `Cannot initialize: rmqr_app_state table does not exist (${loadResult.error}). Please apply database migrations first.`,
+    };
+  }
+
+  if (loadResult.status === 'error') {
+    return {
+      ok: false,
+      status: 'error',
+      message: `Cannot initialize: error checking remote database state (${loadResult.error}).`,
+    };
+  }
+
+  // Remote database is confirmed empty
+  const stateToSync = options.sourceDb || readDb();
+  const syncResult = await syncStateToSupabase(stateToSync);
+  if (syncResult.ok) {
+    memoryDbCache = stateToSync;
+    lastSupabaseHydratedAt = Date.now();
+    return {
+      ok: true,
+      status: 'initialized',
+      message: 'Supabase PostgreSQL database successfully initialized.',
+    };
+  }
+
+  return {
+    ok: false,
+    status: 'sync_failed',
+    message: syncResult.error || 'Failed to sync initial state to Supabase.',
+  };
+}
+
+/**
+ * Asynchronously mutates the database and awaits persistence to Supabase PostgreSQL when configured.
+ * Guarantees serverless functions on Vercel do not terminate before the Supabase write finishes.
+ * Throws or reports errors on write failures when running in production with Supabase configured.
+ */
+export async function mutateDbAsync<T>(
+  mutator: (db: DatabaseSchema) => T | Promise<T>
+): Promise<T> {
+  const db = await readDbAsync();
+  const result = await mutator(db);
+  memoryDbCache = db;
+  tryWriteLocalJsonFile(db);
+
+  if (getSupabaseConfigStatus().configured) {
+    const syncRes = await syncStateToSupabase(db);
+    if (!syncRes.ok) {
+      console.error('[RMQR Database] Failed to persist state to Supabase PostgreSQL:', syncRes.error);
+      if (process.env.VERCEL === '1') {
+        throw new Error(`Database persistence error on Vercel: ${syncRes.error || 'Failed to sync state to Supabase'}`);
+      }
+    } else {
+      lastSupabaseHydratedAt = Date.now();
+    }
+  }
+
   return result;
 }
 

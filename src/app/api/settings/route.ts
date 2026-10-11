@@ -6,14 +6,19 @@ import {
   assertOrgAccess,
   assertPlanEntitlement,
   AuthorizationError,
+  initializeSupabaseDatabase,
   mutateDb,
+  mutateDbAsync,
   readDb,
+  readDbAsync,
 } from '@/lib/db/store';
 import {
   hashPassword,
   sanitizeText,
   validateSafeRedirectUrl,
 } from '@/lib/security';
+import { getAIProviderStatus } from '@/lib/ai/agent-engine';
+import { getSupabaseConfigStatus, importJsonToSupabase } from '@/lib/supabase/server';
 import { OrgRole } from '@/lib/types';
 
 export async function GET() {
@@ -55,6 +60,8 @@ export async function GET() {
       apiKeys,
       webhooks,
       auditLogs,
+      supabaseStatus: getSupabaseConfigStatus(),
+      aiProviderStatus: getAIProviderStatus(),
     });
   } catch (err) {
     if (err instanceof AuthorizationError) {
@@ -298,6 +305,51 @@ export async function POST(req: NextRequest) {
         return endpoint;
       });
       return NextResponse.json({ webhook: wh }, { status: 201 });
+    }
+
+    // 8. Idempotent JSON-to-Supabase PostgreSQL Migration / Dry-Run
+    if (action === 'migrate_json_to_supabase') {
+      const db = await readDbAsync();
+      assertOrgAccess(db, session.user.id, orgId, ['owner', 'admin']);
+      const dryRun = body.dryRun !== false;
+      const includeDemoAccounts = body.includeDemoAccounts === true || body.includeDemoUsers === true;
+      const report = await importJsonToSupabase({
+        db,
+        dryRun,
+        includeDemoAccounts,
+      });
+
+      if (!dryRun) {
+        await mutateDbAsync((state) => {
+          appendAuditLog(state, {
+            organizationId: orgId,
+            actorId: session.user.id,
+            actorEmail: session.user.email,
+            action: 'database.supabase_migrated',
+            entityType: 'database',
+            entityId: orgId,
+            metadata: {
+              dryRun: false,
+              counts: report.counts,
+              warningsCount: report.warnings.length,
+            },
+          });
+        });
+      }
+
+      return NextResponse.json({ report });
+    }
+
+    // 9. Guarded Supabase Database Initialization
+    if (action === 'initialize_supabase') {
+      const db = await readDbAsync();
+      assertOrgAccess(db, session.user.id, orgId, ['owner', 'admin']);
+      const confirmed = body.confirmed === true;
+      const initResult = await initializeSupabaseDatabase({
+        confirmed,
+        sourceDb: db,
+      });
+      return NextResponse.json(initResult, { status: initResult.ok ? 200 : 400 });
     }
 
     return NextResponse.json({ error: 'Unsupported settings action.' }, { status: 400 });

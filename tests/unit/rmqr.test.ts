@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import jsQR from 'jsqr';
 import { PNG } from 'pngjs';
 import { DEFAULT_QR_STYLE } from '@/lib/types';
@@ -25,7 +25,13 @@ import {
   generateCustomerReviewAgentDrafts,
   generateCustomerReviewSuggestions,
   generateOwnerReviewReplyDraft,
+  generateOwnerReviewReplyWithAI,
 } from '@/lib/ai/services';
+import { getAIProviderStatus } from '@/lib/ai/agent-engine';
+import {
+  getSupabaseConfigStatus,
+  importJsonToSupabase,
+} from '@/lib/supabase/server';
 import {
   assertOrgAccess,
   assertPlanEntitlement,
@@ -568,4 +574,176 @@ describe('RM Solution AI Review Agent Website — Honest Review Policy, Multilin
   });
 });
 
+describe('RMQR — Supabase PostgreSQL & Secure Google Gemini API Integration', () => {
+  it('never invents fake dishes from a bare filename in extractMenuCandidates and validates MIME types', async () => {
+    const bareFilenameResult = await extractMenuCandidates({
+      fileName: 'dinner-menu-photo.jpg',
+    });
+    expect(bareFilenameResult.provider).toBe('deterministic_parser');
+    expect(bareFilenameResult.candidates).toHaveLength(0);
+    expect(bareFilenameResult.warnings.some((w) => w.includes('filename alone'))).toBe(true);
 
+    const invalidMimeResult = await extractMenuCandidates({
+      imageBase64: 'ZmFrZS1pbWFnZS1kYXRh',
+      mimeType: 'application/pdf',
+    });
+    expect(invalidMimeResult.candidates).toHaveLength(0);
+    expect(invalidMimeResult.warnings.some((w) => w.includes('Unsupported image MIME type'))).toBe(
+      true
+    );
+  });
+
+  it('always labels synchronous generateOwnerReviewReplyDraft as template even when GEMINI_API_KEY is set, and uses x-goog-api-key header in generateOwnerReviewReplyWithAI', async () => {
+    const prevKey = process.env.GEMINI_API_KEY;
+    const prevModel = process.env.GEMINI_MODEL;
+    const originalFetch = global.fetch;
+
+    try {
+      process.env.GEMINI_API_KEY = 'test-server-only-gemini-key';
+      process.env.GEMINI_MODEL = 'gemini-2.5-flash';
+
+      const status = getAIProviderStatus();
+      expect(status.configured).toBe(true);
+      expect(status.provider).toBe('gemini');
+      expect(status.model).toBe('gemini-2.5-flash');
+
+      // Synchronous template function must NEVER claim provider === 'gemini'
+      const syncResult = generateOwnerReviewReplyDraft({
+        businessName: 'RM Solution',
+        reviewerName: 'Amit',
+        rating: 5,
+        reviewText: 'Great service!',
+      });
+      expect(syncResult.provider).toBe('template');
+
+      // Mock successful Gemini HTTP response and verify x-goog-api-key header is used (and key is NOT in URL)
+      let capturedUrl = '';
+      let capturedApiKeyHeader = '';
+      global.fetch = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+        capturedUrl = String(url);
+        const headers = (init?.headers || {}) as Record<string, string>;
+        capturedApiKeyHeader = headers['x-goog-api-key'] || '';
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    {
+                      text: JSON.stringify({
+                        options: [
+                          'Thank you Amit for your kind feedback about RM Solution!',
+                          'We appreciate your 5-star review, Amit! Glad we could help at RM Solution.',
+                          'Thanks Amit! Looking forward to serving you again at RM Solution.',
+                        ],
+                      }),
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        };
+      }) as unknown as typeof fetch;
+
+      const aiResult = await generateOwnerReviewReplyWithAI({
+        businessName: 'RM Solution',
+        reviewerName: 'Amit',
+        rating: 5,
+        reviewText: 'Great service!',
+      });
+      expect(aiResult.provider).toBe('gemini');
+      expect(capturedUrl).toContain('gemini-2.5-flash:generateContent');
+      expect(capturedUrl).not.toContain('test-server-only-gemini-key');
+      expect(capturedApiKeyHeader).toBe('test-server-only-gemini-key');
+      expect(aiResult.draftReply).toContain('Amit');
+
+      // Mock Gemini HTTP failure -> must fall back cleanly to provider: 'template'
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+      }) as unknown as typeof fetch;
+
+      const fallbackResult = await generateOwnerReviewReplyWithAI({
+        businessName: 'RM Solution',
+        reviewerName: 'Amit',
+        rating: 5,
+        reviewText: 'Great service!',
+      });
+      expect(fallbackResult.provider).toBe('template');
+    } finally {
+      if (prevKey === undefined) delete process.env.GEMINI_API_KEY;
+      else process.env.GEMINI_API_KEY = prevKey;
+      if (prevModel === undefined) delete process.env.GEMINI_MODEL;
+      else process.env.GEMINI_MODEL = prevModel;
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('prepares idempotent JSON-to-Supabase PostgreSQL migration in dryRun mode and excludes default demo accounts by default', async () => {
+    const db = readDb();
+    const dryRunReport = await importJsonToSupabase({
+      db,
+      dryRun: true,
+      includeDemoAccounts: false,
+    });
+
+    expect(dryRunReport.dryRun).toBe(true);
+    expect(dryRunReport.skippedDemoAccounts).toContain('admin@rmqr.app');
+    expect(dryRunReport.skippedDemoAccounts).toContain('owner@rmqr.app');
+    expect(dryRunReport.counts.organizations).toBeGreaterThanOrEqual(1);
+    expect(dryRunReport.counts.qrCodes).toBeGreaterThanOrEqual(1);
+    expect(dryRunReport.counts.reviewCampaigns).toBeGreaterThanOrEqual(1);
+
+    const supabaseConfig = getSupabaseConfigStatus();
+    expect(typeof supabaseConfig.configured).toBe('boolean');
+    expect(typeof supabaseConfig.statusMessage).toBe('string');
+  });
+
+  it('guarantees loadStateFromSupabase handles unconfigured or error states gracefully without remote data overwrite', async () => {
+    const { loadStateFromSupabase } = await import('@/lib/supabase/server');
+    const result = await loadStateFromSupabase();
+    expect(['ok', 'empty', 'unconfigured', 'missing_table', 'error']).toContain(result.status);
+    if (result.status === 'ok') {
+      expect(result.data).toBeDefined();
+    } else {
+      expect((result as any).data).toBeUndefined();
+    }
+  });
+
+  it('enforces guarded initialization for initializeSupabaseDatabase requiring confirmed: true', async () => {
+    const { initializeSupabaseDatabase } = await import('@/lib/db/store');
+    const result = await initializeSupabaseDatabase({ confirmed: false });
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe('unconfirmed');
+    expect(result.message).toContain('confirmation');
+  });
+
+  it('enforces strong RMQR_SESSION_SECRET in production and rejects weak/missing secrets', async () => {
+    const { getSigningSecret } = await import('@/lib/auth/session');
+    const originalEnv = process.env.NODE_ENV;
+    const originalSecret = process.env.RMQR_SESSION_SECRET;
+
+    try {
+      (process.env as any).NODE_ENV = 'production';
+      delete process.env.RMQR_SESSION_SECRET;
+
+      expect(() => getSigningSecret()).toThrow('RMQR_SESSION_SECRET environment variable is required');
+
+      process.env.RMQR_SESSION_SECRET = 'short';
+      expect(() => getSigningSecret()).toThrow('at least 32 characters');
+
+      process.env.RMQR_SESSION_SECRET = 'a_very_long_secure_secret_for_rmqr_production_tests_32_chars';
+      expect(getSigningSecret()).toBe('a_very_long_secure_secret_for_rmqr_production_tests_32_chars');
+    } finally {
+      (process.env as any).NODE_ENV = originalEnv;
+      if (originalSecret !== undefined) {
+        process.env.RMQR_SESSION_SECRET = originalSecret;
+      } else {
+        delete process.env.RMQR_SESSION_SECRET;
+      }
+    }
+  });
+});

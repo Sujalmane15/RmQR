@@ -144,33 +144,76 @@ export const AI_AGENT_CATEGORY_META: Record<
   },
 };
 
+const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
+
+function isValidApiKeyCandidate(key: string | undefined): boolean {
+  if (!key) return false;
+  const trimmed = key.trim();
+  if (trimmed.length < 12) return false;
+  if (/^(your_|placeholder|<|paste_|insert_|todo)/i.test(trimmed)) return false;
+  return true;
+}
+
+export function getServerGeminiModel(): string {
+  const raw = (process.env.GEMINI_MODEL || process.env.AI_MODEL || DEFAULT_GEMINI_MODEL).trim();
+  // Ensure only safe model identifier characters are allowed
+  if (!/^[a-zA-Z0-9._-]+$/.test(raw)) {
+    return DEFAULT_GEMINI_MODEL;
+  }
+  return raw;
+}
+
+export function getServerGeminiApiKey(): string {
+  if (typeof window !== 'undefined') {
+    throw new Error('Security violation: Gemini API key must only be read on the server.');
+  }
+  const geminiKey = (process.env.GEMINI_API_KEY || '').trim();
+  if (isValidApiKeyCandidate(geminiKey)) {
+    return geminiKey;
+  }
+  const fallbackAiKey = (process.env.AI_API_KEY || '').trim();
+  if (isValidApiKeyCandidate(fallbackAiKey) && !fallbackAiKey.startsWith('sk-')) {
+    return fallbackAiKey;
+  }
+  return '';
+}
+
 /**
- * Inspects environment variables to determine whether a live AI provider is configured.
- * Supports AI_PROVIDER / AI_MODEL / AI_API_KEY as well as GEMINI_API_KEY / OPENAI_API_KEY.
+ * Inspects server-side environment variables to determine whether a live AI provider is configured.
+ * Supports GEMINI_API_KEY / GEMINI_MODEL as well as AI_PROVIDER / AI_MODEL / AI_API_KEY / OPENAI_API_KEY.
+ * Never reads or accepts NEXT_PUBLIC_* variables for AI keys.
  */
 export function getAIProviderStatus(): AIProviderStatus {
   const explicitProvider = (process.env.AI_PROVIDER || '').toLowerCase().trim();
-  const aiApiKey = (process.env.AI_API_KEY || '').trim();
-  const geminiKey = (process.env.GEMINI_API_KEY || '').trim();
-  const openaiKey = (process.env.OPENAI_API_KEY || '').trim();
+  const aiApiKey = isValidApiKeyCandidate(process.env.AI_API_KEY)
+    ? (process.env.AI_API_KEY || '').trim()
+    : '';
+  const geminiKey = isValidApiKeyCandidate(process.env.GEMINI_API_KEY)
+    ? (process.env.GEMINI_API_KEY || '').trim()
+    : '';
+  const openaiKey = isValidApiKeyCandidate(process.env.OPENAI_API_KEY)
+    ? (process.env.OPENAI_API_KEY || '').trim()
+    : '';
+  const geminiModel = getServerGeminiModel();
+  const openaiModel = (process.env.AI_MODEL || 'gpt-4o-mini').trim();
 
-  if (explicitProvider === 'openai' && (aiApiKey || openaiKey)) {
+  if (explicitProvider === 'openai' && (openaiKey || aiApiKey)) {
     return {
       configured: true,
       provider: 'openai',
-      model: (process.env.AI_MODEL || 'gpt-4o-mini').trim(),
-      envVarUsed: aiApiKey ? 'AI_API_KEY' : 'OPENAI_API_KEY',
+      model: openaiModel,
+      envVarUsed: openaiKey ? 'OPENAI_API_KEY' : 'AI_API_KEY',
       setupMessage: 'Live OpenAI API integration is active.',
     };
   }
 
-  if (explicitProvider === 'gemini' && (aiApiKey || geminiKey)) {
+  if (explicitProvider === 'gemini' && (geminiKey || aiApiKey)) {
     return {
       configured: true,
       provider: 'gemini',
-      model: (process.env.AI_MODEL || 'gemini-2.0-flash').trim(),
-      envVarUsed: aiApiKey ? 'AI_API_KEY' : 'GEMINI_API_KEY',
-      setupMessage: 'Live Google Gemini API integration is active.',
+      model: geminiModel,
+      envVarUsed: geminiKey ? 'GEMINI_API_KEY' : 'AI_API_KEY',
+      setupMessage: `Live Google Gemini API integration (${geminiModel}) is active.`,
     };
   }
 
@@ -178,9 +221,9 @@ export function getAIProviderStatus(): AIProviderStatus {
     return {
       configured: true,
       provider: 'gemini',
-      model: (process.env.AI_MODEL || 'gemini-2.0-flash').trim(),
+      model: geminiModel,
       envVarUsed: geminiKey ? 'GEMINI_API_KEY' : 'AI_API_KEY',
-      setupMessage: 'Live Google Gemini API integration is active.',
+      setupMessage: `Live Google Gemini API integration (${geminiModel}) is active.`,
     };
   }
 
@@ -188,7 +231,7 @@ export function getAIProviderStatus(): AIProviderStatus {
     return {
       configured: true,
       provider: 'openai',
-      model: (process.env.AI_MODEL || 'gpt-4o-mini').trim(),
+      model: openaiModel,
       envVarUsed: openaiKey ? 'OPENAI_API_KEY' : 'AI_API_KEY',
       setupMessage: 'Live OpenAI API integration is active.',
     };
@@ -197,10 +240,10 @@ export function getAIProviderStatus(): AIProviderStatus {
   return {
     configured: false,
     provider: 'unconfigured',
-    model: (process.env.AI_MODEL || 'gemini-2.0-flash').trim(),
+    model: geminiModel,
     envVarUsed: null,
     setupMessage:
-      'Live AI LLM key is not configured. Set AI_PROVIDER (gemini or openai), AI_MODEL, and AI_API_KEY (or GEMINI_API_KEY / OPENAI_API_KEY) in .env.local and restart the dev server. Currently running in Grounded Knowledge Retrieval Mode.',
+      'Live AI API key is not configured. Set GEMINI_API_KEY and GEMINI_MODEL in .env.local (or Vercel Environment Variables) and restart the server. Currently running in Grounded Knowledge Retrieval / Template Mode.',
   };
 }
 
@@ -438,6 +481,10 @@ async function callGeminiProvider(params: {
   history: Pick<AIMessage, 'role' | 'content'>[];
   userMessage: string;
 }): Promise<string> {
+  if (!isValidApiKeyCandidate(params.apiKey)) {
+    throw new Error('Gemini API key is missing or invalid.');
+  }
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15000);
 
@@ -455,11 +502,14 @@ async function callGeminiProvider(params: {
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
       params.model
-    )}:generateContent?key=${encodeURIComponent(params.apiKey)}`;
+    )}:generateContent`;
 
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': params.apiKey,
+      },
       signal: controller.signal,
       body: JSON.stringify({
         systemInstruction: {
@@ -495,6 +545,10 @@ async function callOpenAIProvider(params: {
   history: Pick<AIMessage, 'role' | 'content'>[];
   userMessage: string;
 }): Promise<string> {
+  if (!isValidApiKeyCandidate(params.apiKey)) {
+    throw new Error('OpenAI API key is missing or invalid.');
+  }
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15000);
 
@@ -580,12 +634,10 @@ export async function generateAgentChatResponse(params: {
   // 3. If live AI provider credentials are configured, execute server-side LLM request
   if (providerStatus.configured) {
     const systemPrompt = buildSystemInstruction(params.agent, contextChunks);
-    const apiKey = (
-      process.env.AI_API_KEY ||
-      process.env.GEMINI_API_KEY ||
-      process.env.OPENAI_API_KEY ||
-      ''
-    ).trim();
+    const apiKey =
+      providerStatus.provider === 'openai'
+        ? (process.env.OPENAI_API_KEY || process.env.AI_API_KEY || '').trim()
+        : getServerGeminiApiKey();
 
     try {
       const llmReply =
@@ -611,9 +663,9 @@ export async function generateAgentChatResponse(params: {
         aiConfigured: true,
         groundedSources,
       };
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : 'Provider request failed';
-      // Fall back safely to grounded knowledge if provider times out or rate-limits, with explicit warning
+    } catch {
+      const safeWarning =
+        'Live AI provider request timed out or failed; answered using verified business knowledge lookup.';
       if (relevantChunks.length > 0) {
         const topSummary = relevantChunks
           .slice(0, 3)
@@ -624,7 +676,7 @@ export async function generateAgentChatResponse(params: {
           providerUsed: 'knowledge_grounded_local',
           aiConfigured: true,
           groundedSources,
-          providerWarning: `Live AI provider encountered an error (${errMsg}); answered using direct knowledge lookup.`,
+          providerWarning: safeWarning,
         };
       }
       return {
@@ -632,7 +684,7 @@ export async function generateAgentChatResponse(params: {
         providerUsed: 'unconfigured',
         aiConfigured: true,
         groundedSources: [],
-        providerWarning: `Live AI provider encountered an error (${errMsg}).`,
+        providerWarning: safeWarning,
       };
     }
   }

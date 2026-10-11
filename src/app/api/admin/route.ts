@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getCurrentSession } from '@/lib/auth/session';
-import { appendAuditLog, mutateDb, readDb } from '@/lib/db/store';
+import { appendAuditLog, mutateDbAsync, readDbAsync } from '@/lib/db/store';
 
 export async function GET() {
   try {
@@ -15,7 +15,7 @@ export async function GET() {
       );
     }
 
-    const db = readDb();
+    const db = await readDbAsync();
 
     const organizations = db.organizations.map((org) => {
       const sub = db.subscriptions.find((s) => s.organizationId === org.id);
@@ -79,7 +79,7 @@ export async function PATCH(req: NextRequest) {
     if (action === 'set_org_status') {
       const orgId = String(body.organizationId || '');
       const status = body.status === 'suspended' ? 'suspended' : 'active';
-      const updated = mutateDb((db) => {
+      const updated = await mutateDbAsync((db) => {
         const org = db.organizations.find((o) => o.id === orgId);
         if (!org) return null;
         org.status = status;
@@ -105,7 +105,7 @@ export async function PATCH(req: NextRequest) {
     if (action === 'update_ticket_status') {
       const ticketId = String(body.ticketId || '');
       const status = body.status as 'open' | 'in_progress' | 'resolved';
-      const updated = mutateDb((db) => {
+      const updated = await mutateDbAsync((db) => {
         const ticket = db.supportTickets.find((t) => t.id === ticketId);
         if (!ticket) return null;
         ticket.status = status;

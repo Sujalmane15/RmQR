@@ -32,12 +32,14 @@ export async function POST(req: NextRequest) {
         return { token };
       });
 
+      const isProduction = process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
+
       return NextResponse.json({
         ok: true,
         message:
           'If an account exists for that email, password reset instructions have been generated.',
-        // In local dev without SMTP configured, return the dev token so the flow can be tested end-to-end
-        devResetToken: resetInfo?.token || null,
+        // Only return the dev reset token in local development without SMTP configured
+        devResetToken: !isProduction ? resetInfo?.token || null : null,
       });
     }
 

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
 import { z } from 'zod';
-import { appendAuditLog, mutateDb, readDb } from '@/lib/db/store';
+import { appendAuditLog, mutateDbAsync, readDbAsync } from '@/lib/db/store';
 import {
   checkRateLimit,
   generateShortSlug,
@@ -48,7 +48,7 @@ export async function POST(req: NextRequest) {
     );
     const industry = sanitizeText(parsed.data.industry || 'General Business', 60);
 
-    const existingDb = readDb();
+    const existingDb = await readDbAsync();
     if (existingDb.profiles.some((p) => p.email.toLowerCase() === email)) {
       return NextResponse.json(
         { error: 'An account with this email address already exists.' },
@@ -62,7 +62,7 @@ export async function POST(req: NextRequest) {
     const orgId = crypto.randomUUID();
     const orgSlug = generateShortSlug(orgName);
 
-    const result = mutateDb((db) => {
+    const result = await mutateDbAsync((db) => {
       const newProfile = {
         id: userId,
         email,
@@ -149,8 +149,11 @@ export async function POST(req: NextRequest) {
       { status: 201 }
     );
 
+    const isProduction = process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
+
     res.cookies.set(SESSION_COOKIE_NAME, token, {
       httpOnly: true,
+      secure: isProduction,
       sameSite: 'lax',
       path: '/',
       maxAge: 60 * 60 * 24 * 7,

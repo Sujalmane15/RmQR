@@ -4,7 +4,7 @@
 
 import crypto from 'crypto';
 import { cookies } from 'next/headers';
-import { readDb } from '../db/store';
+import { readDbAsync } from '../db/store';
 import { Organization, OrgRole, Profile, Subscription } from '../types';
 
 export const SESSION_COOKIE_NAME = 'rmqr_session';
@@ -23,8 +23,26 @@ export interface AuthenticatedContext {
   subscription: Subscription;
 }
 
-function getSigningSecret(): string {
-  return process.env.RMQR_SESSION_SECRET || 'rmqr-default-hmac-signing-secret-2026-secure';
+export function getSigningSecret(): string {
+  const secret = (process.env.RMQR_SESSION_SECRET || '').trim();
+  const isProduction = process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
+
+  if (!secret) {
+    if (isProduction) {
+      throw new Error(
+        'Critical security violation: RMQR_SESSION_SECRET environment variable is required in production and cannot be empty.'
+      );
+    }
+    return 'rmqr-default-hmac-signing-secret-2026-secure';
+  }
+
+  if (isProduction && secret.length < 32) {
+    throw new Error(
+      'Critical security violation: RMQR_SESSION_SECRET must be at least 32 characters long in production.'
+    );
+  }
+
+  return secret;
 }
 
 export function createSessionToken(userId: string, activeOrgId: string, ttlSeconds = 60 * 60 * 24 * 7): string {
@@ -71,7 +89,7 @@ export async function getCurrentSession(): Promise<AuthenticatedContext | null> 
     const payload = verifySessionToken(rawToken);
     if (!payload) return null;
 
-    const db = readDb();
+    const db = await readDbAsync();
     const profile = db.profiles.find((p) => p.id === payload.userId);
     if (!profile) return null;
 
