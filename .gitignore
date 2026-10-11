@@ -15,3 +15,6 @@ coverage/
 data/rmqr-db.json
 data/rmqr-db.backup.json
 data/*.tmp
+
+*.tsbuildinfo
+tsconfig.tsbuildinfo
