@@ -1,0 +1,15 @@
+node_modules/
+.next/
+out/
+build/
+.env
+.env.local
+.env.*.local
+playwright-report/
+test-results/
+coverage/
+*.log
+.DS_Store
+
+data/rmqr-db.json
+data/rmqr-db.backup.json
