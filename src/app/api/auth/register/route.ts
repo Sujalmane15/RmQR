@@ -161,9 +161,10 @@ export async function POST(req: NextRequest) {
 
     return res;
   } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
     console.error('Register error:', err);
     return NextResponse.json(
-      { error: 'Unable to complete registration.' },
+      { error: `Registration error: ${detail}` },
       { status: 500 }
     );
   }
